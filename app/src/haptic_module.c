@@ -19,28 +19,73 @@
 #include "haptic_module.h"
 #include "hpi_common_types.h"
 
-/* HR threshold for motor trigger (BPM) */
-#define HAPTIC_HR_THRESHOLD_BPM  100
+/* ------------------------------------------------------------------ */
+/* Constants                                                           */
+/* ------------------------------------------------------------------ */
 
-/* GSR threshold for motor trigger (raw ADC units, empirically tuned) */
-#define HAPTIC_GSR_THRESHOLD         2000
+/* Slow baseline EMA — alpha = 1/100 = 0.01 */
+#define HAPTIC_BASELINE_ALPHA_NUM    1
+#define HAPTIC_BASELINE_ALPHA_DEN    100
 
-/* Max change between consecutive batches before treating as motion artifact */
-#define HAPTIC_GSR_ROC_THRESHOLD     5000
+/* Warmup: minimum valid samples before baseline is trusted */
+#define HAPTIC_HR_BASELINE_WARMUP    60    /* ~60s at 1 HR/s */
+#define HAPTIC_GSR_BASELINE_WARMUP   120   /* ~2 min of valid GSR batches */
+#define HAPTIC_HRV_BASELINE_WARMUP   30    /* 30 RMSSD computations */
 
-/* EMA alpha = 5/100 = 0.05 — smooths noise, tracks slow stress responses */
-#define HAPTIC_GSR_EMA_ALPHA_NUM     5
+/* Deviation thresholds — percentage rise/drop from personal baseline */
+#define HAPTIC_HR_RISE_PCT           50    /* HR > baseline * 1.50 */
+#define HAPTIC_GSR_RISE_PCT          60    /* GSR EMA > baseline * 1.60 */
+#define HAPTIC_HRV_DROP_PCT          30    /* RMSSD < baseline * 0.70 */
+
+/* All three sensors must flag stress within this window to trigger */
+#define HAPTIC_COMBINED_WINDOW_MS    60000
+
+/* Minimum time between combined triggers */
+#define HAPTIC_COOLDOWN_MS           30000
+
+/* GSR signal filter parameters */
+#define HAPTIC_GSR_ROC_THRESHOLD     500    /* Max batch-to-batch change before motion reject */
+#define HAPTIC_GSR_EMA_ALPHA_NUM     2      /* Fast EMA alpha = 2/100 = 0.02 — slower response to transients */
 #define HAPTIC_GSR_EMA_ALPHA_DEN     100
+#define HAPTIC_GSR_DEBOUNCE_BATCHES  32     /* Consecutive batches above threshold before flag */
+#define HAPTIC_GSR_MIN_VALID         1      /* Raw ADC lower bound */
+#define HAPTIC_GSR_MAX_VALID         10000  /* Raw ADC upper bound */
+#define HAPTIC_GSR_EMA_MAX_DELTA     30     /* Max EMA change per batch — slew-limits transient spikes */
+#define HAPTIC_GSR_EMA_ROC_THRESHOLD 20     /* Max EMA rise per batch before spike recovery triggered */
+#define HAPTIC_GSR_BASELINE_SCALE    100    /* Baseline stored ×100 to preserve sub-unit precision through alpha=0.01 EMA */
 
-/* Consecutive batches of smoothed signal above threshold before triggering (~2s) */
-#define HAPTIC_GSR_DEBOUNCE_BATCHES  16
+/* Require this many consecutive below-threshold RMSSD samples before flagging HRV */
+#define HAPTIC_HRV_DEBOUNCE_COUNT    3
 
-/* Minimum time between triggers (ms) */
-#define HAPTIC_COOLDOWN_MS       30000
+/* Reject RMSSD computations this far above baseline as movement artifacts */
+#define HAPTIC_HRV_SPIKE_PCT         25     /* rmssd > baseline * 1.25 → spike */
+
+/* Cap on the very first warmup seed value. If the initial RMSSD computation
+ * occurs during movement (common when first putting the device on), an
+ * uncapped seed of 300+ ms propagates through the one-sided warmup and leaves
+ * the baseline too high for the settled resting state. */
+#define HAPTIC_HRV_WARMUP_SEED_MAX_MS    200
+
+/* HRV rolling window */
+#define HAPTIC_HRV_WINDOW            20
+
+/* HRV warmup uses a faster alpha (2/10 = 0.2) and only allows downward movement.
+ * This prevents early inflated RMSSD values from permanently elevating the baseline. */
+#define HAPTIC_HRV_WARMUP_ALPHA_NUM  2
+#define HAPTIC_HRV_WARMUP_ALPHA_DEN  10
+
+/* HRV baseline is stored scaled by this factor to preserve sub-ms precision
+ * through the alpha=0.01 EMA. Without scaling, integer truncation freezes the
+ * baseline — e.g. (134*99 + 165)/100 = 134 forever. */
+#define HAPTIC_HRV_BASELINE_SCALE    100
 
 LOG_MODULE_REGISTER(haptic_module, LOG_LEVEL_DBG);
 
 #define DOG_DEVICE_NAME "Dog Device Receiver"
+
+/* ------------------------------------------------------------------ */
+/* BLE state                                                           */
+/* ------------------------------------------------------------------ */
 
 /* Service UUID: 19B10000-E8F2-537E-4F6C-D104768A1214 */
 static struct bt_uuid_128 dog_svc_uuid = BT_UUID_INIT_128(
@@ -57,7 +102,34 @@ static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_write_params write_params;
 static uint8_t write_buf;
 
+/* ------------------------------------------------------------------ */
+/* Per-sensor dynamic baseline state                                   */
+/* ------------------------------------------------------------------ */
+
+struct haptic_sensor_state {
+	int32_t  baseline;
+	uint16_t warmup_count;
+	bool     stressed;
+	int64_t  flagged_at_ms;
+};
+
+static struct haptic_sensor_state hr_state;
+static struct haptic_sensor_state gsr_state;
+static struct haptic_sensor_state hrv_state;
+
 static int64_t last_trigger_time;
+
+/* ------------------------------------------------------------------ */
+/* HRV circular buffer                                                 */
+/* ------------------------------------------------------------------ */
+
+static uint16_t hrv_rr_buf[HAPTIC_HRV_WINDOW];
+static uint8_t  hrv_rr_count;
+static uint8_t  hrv_rr_head;
+
+/* ------------------------------------------------------------------ */
+/* Scanning                                                            */
+/* ------------------------------------------------------------------ */
 
 static void start_scan(void);
 
@@ -70,7 +142,7 @@ static void scan_start_work_handler(struct k_work *work)
 static K_WORK_DELAYABLE_DEFINE(scan_start_work, scan_start_work_handler);
 
 /* ------------------------------------------------------------------ */
-/* GATT discovery                                                       */
+/* GATT discovery                                                      */
 /* ------------------------------------------------------------------ */
 
 static uint8_t discover_cb(struct bt_conn *conn,
@@ -123,7 +195,7 @@ static bool parse_adv(struct bt_data *data, void *user_data)
 
 	if (data->type != BT_DATA_NAME_COMPLETE &&
 	    data->type != BT_DATA_NAME_SHORTENED) {
-		return true; /* continue parsing */
+		return true;
 	}
 
 	if (data->data_len == sizeof(DOG_DEVICE_NAME) - 1 &&
@@ -131,7 +203,7 @@ static bool parse_adv(struct bt_data *data, void *user_data)
 		d->found = true;
 	}
 
-	return false; /* stop parsing */
+	return false;
 }
 
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
@@ -140,7 +212,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 	struct adv_parse_data d = { .found = false };
 
 	if (dog_conn) {
-		return; /* already connected or connecting */
+		return;
 	}
 
 	bt_data_parse(buf, parse_adv, &d);
@@ -176,14 +248,13 @@ static void start_scan(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Connection callbacks — registered via BT_CONN_CB_DEFINE so they    */
-/* coexist alongside ble_module.c's own BT_CONN_CB_DEFINE block.      */
+/* Connection callbacks                                                */
 /* ------------------------------------------------------------------ */
 
 static void haptic_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (conn != dog_conn) {
-		return; /* not our outbound connection */
+		return;
 	}
 
 	if (err) {
@@ -221,7 +292,7 @@ static void haptic_disconnected(struct bt_conn *conn, uint8_t reason)
 	dog_conn = NULL;
 	chr_handle_valid = false;
 
-	start_scan(); /* auto-reconnect */
+	start_scan();
 }
 
 BT_CONN_CB_DEFINE(haptic_conn_callbacks) = {
@@ -268,25 +339,23 @@ int haptic_send_alert(uint8_t value)
 }
 
 /* ------------------------------------------------------------------ */
-/* HR-based trigger                                                    */
+/* Combined alert work item                                            */
 /* ------------------------------------------------------------------ */
 
-static void haptic_hr_alert_work_handler(struct k_work *work)
+static void haptic_combined_alert_work_handler(struct k_work *work)
 {
 	haptic_send_alert(1);
 }
 
-static K_WORK_DEFINE(haptic_hr_alert_work, haptic_hr_alert_work_handler);
+static K_WORK_DEFINE(haptic_combined_alert_work, haptic_combined_alert_work_handler);
 
-static void haptic_hr_listener(const struct zbus_channel *chan)
+/* ------------------------------------------------------------------ */
+/* Combined trigger check                                              */
+/* ------------------------------------------------------------------ */
+
+static void haptic_check_combined(void)
 {
-	const struct hpi_hr_t *hr = zbus_chan_const_msg(chan);
-
-	if (!hr->hr_ready_flag || hr->hr == 0) {
-		return;
-	}
-
-	if (hr->hr < HAPTIC_HR_THRESHOLD_BPM) {
+	if (!hr_state.stressed || !gsr_state.stressed || !hrv_state.stressed) {
 		return;
 	}
 
@@ -296,33 +365,113 @@ static void haptic_hr_listener(const struct zbus_channel *chan)
 		return;
 	}
 
+	/* Find the oldest flag timestamp — all three must be within the window */
+	int64_t oldest = hr_state.flagged_at_ms;
+
+	if (gsr_state.flagged_at_ms < oldest) {
+		oldest = gsr_state.flagged_at_ms;
+	}
+	if (hrv_state.flagged_at_ms < oldest) {
+		oldest = hrv_state.flagged_at_ms;
+	}
+
+	if ((now - oldest) > HAPTIC_COMBINED_WINDOW_MS) {
+		return;
+	}
+
 	last_trigger_time = now;
-	LOG_INF("HR trigger: %u BPM >= %u", hr->hr, HAPTIC_HR_THRESHOLD_BPM);
-	k_work_submit(&haptic_hr_alert_work);
+	LOG_INF("haptic: COMBINED TRIGGER — HR %lld ms ago, GSR %lld ms ago, HRV %lld ms ago",
+		(long long)(now - hr_state.flagged_at_ms),
+		(long long)(now - gsr_state.flagged_at_ms),
+		(long long)(now - hrv_state.flagged_at_ms));
+
+	hr_state.stressed      = false;
+	hr_state.flagged_at_ms = 0;
+	gsr_state.stressed      = false;
+	gsr_state.flagged_at_ms = 0;
+	hrv_state.stressed      = false;
+	hrv_state.flagged_at_ms = 0;
+
+	k_work_submit(&haptic_combined_alert_work);
+}
+
+/* ------------------------------------------------------------------ */
+/* HR-based stress detection                                           */
+/* ------------------------------------------------------------------ */
+
+static void haptic_hr_listener(const struct zbus_channel *chan)
+{
+	const struct hpi_hr_t *hr = zbus_chan_const_msg(chan);
+
+	if (!hr->hr_ready_flag || hr->hr == 0) {
+		return;
+	}
+
+	int32_t current_hr = (int32_t)hr->hr;
+
+	/* Physiological sanity gate */
+	if (current_hr < 30 || current_hr > 220) {
+		return;
+	}
+
+	/* Warmup — accumulate baseline, no stress detection yet */
+	if (hr_state.warmup_count < HAPTIC_HR_BASELINE_WARMUP) {
+		hr_state.baseline = (hr_state.warmup_count == 0)
+			? current_hr
+			: (hr_state.baseline * (HAPTIC_BASELINE_ALPHA_DEN - HAPTIC_BASELINE_ALPHA_NUM) +
+			   current_hr * HAPTIC_BASELINE_ALPHA_NUM) / HAPTIC_BASELINE_ALPHA_DEN;
+		hr_state.warmup_count++;
+
+		static int64_t last_hr_warmup_log;
+		int64_t now_w = k_uptime_get();
+
+		if ((now_w - last_hr_warmup_log) >= 5000) {
+			LOG_INF("HR: warming up (%u/%u) hr=%d baseline=%d",
+				hr_state.warmup_count, HAPTIC_HR_BASELINE_WARMUP,
+				current_hr, hr_state.baseline);
+			last_hr_warmup_log = now_w;
+		}
+		return;
+	}
+
+	/* Update baseline — freeze while stressed to preserve resting reference */
+	if (!hr_state.stressed) {
+		hr_state.baseline = (hr_state.baseline * (HAPTIC_BASELINE_ALPHA_DEN - HAPTIC_BASELINE_ALPHA_NUM) +
+				     current_hr * HAPTIC_BASELINE_ALPHA_NUM) / HAPTIC_BASELINE_ALPHA_DEN;
+	}
+
+	/* Threshold: baseline + 20% */
+	int32_t threshold = hr_state.baseline + (hr_state.baseline * HAPTIC_HR_RISE_PCT / 100);
+
+	static int64_t last_hr_log;
+	int64_t now = k_uptime_get();
+
+	if ((now - last_hr_log) >= 5000) {
+		LOG_INF("HR: current=%d baseline=%d threshold=%d stressed=%d",
+			current_hr, hr_state.baseline, threshold, (int)hr_state.stressed);
+		last_hr_log = now;
+	}
+
+	if (current_hr > threshold) {
+		if (!hr_state.stressed) {
+			hr_state.stressed      = true;
+			hr_state.flagged_at_ms = k_uptime_get();
+			LOG_INF("HR flagged: %d > %d (baseline=%d)",
+				current_hr, threshold, hr_state.baseline);
+		}
+	} else {
+		hr_state.stressed      = false;
+		hr_state.flagged_at_ms = 0;
+	}
+
+	haptic_check_combined();
 }
 
 ZBUS_LISTENER_DEFINE(haptic_hr_lis, haptic_hr_listener);
 
 /* ------------------------------------------------------------------ */
-/* HRV (RMSSD) based trigger                                           */
+/* HRV (RMSSD) based stress detection                                  */
 /* ------------------------------------------------------------------ */
-
-/* Rolling window size (number of RR intervals) */
-#define HAPTIC_HRV_WINDOW            20
-
-/* RMSSD threshold — trigger when RMSSD drops below this (ms) */
-#define HAPTIC_HRV_RMSSD_THRESHOLD   70
-
-static uint16_t hrv_rr_buf[HAPTIC_HRV_WINDOW];
-static uint8_t  hrv_rr_count;
-static uint8_t  hrv_rr_head;
-
-static void haptic_hrv_alert_work_handler(struct k_work *work)
-{
-	haptic_send_alert(1);
-}
-
-static K_WORK_DEFINE(haptic_hrv_alert_work, haptic_hrv_alert_work_handler);
 
 void haptic_process_rtor(uint16_t rtor_ms)
 {
@@ -338,8 +487,10 @@ void haptic_process_rtor(uint16_t rtor_ms)
 		hrv_rr_count++;
 	}
 
-	/* Need at least 2 intervals to compute RMSSD */
-	if (hrv_rr_count < 2) {
+	/* Wait for a full window before computing RMSSD — partial-buffer values
+	 * (e.g. rmssd=29 from only 2 intervals) corrupt the baseline if fed
+	 * during warmup. */
+	if (hrv_rr_count < HAPTIC_HRV_WINDOW) {
 		return;
 	}
 
@@ -363,57 +514,134 @@ void haptic_process_rtor(uint16_t rtor_ms)
 
 	uint32_t rmssd = (uint32_t)sqrt((double)(sum_sq / pairs));
 
+	/* Warmup phase — baseline stored scaled by HAPTIC_HRV_BASELINE_SCALE to
+	 * preserve fractional precision through the alpha=0.01 EMA. */
+	if (hrv_state.warmup_count < HAPTIC_HRV_BASELINE_WARMUP) {
+		/* Cap the seed to prevent a movement spike on first wear from
+		 * permanently inflating the warmup baseline. */
+		uint32_t rmssd_seed = (rmssd > HAPTIC_HRV_WARMUP_SEED_MAX_MS)
+					? HAPTIC_HRV_WARMUP_SEED_MAX_MS : rmssd;
+		int32_t rmssd_fp = (int32_t)rmssd * HAPTIC_HRV_BASELINE_SCALE;
+		if (hrv_state.warmup_count == 0) {
+			hrv_state.baseline = (int32_t)rmssd_seed * HAPTIC_HRV_BASELINE_SCALE;
+		} else {
+			int32_t new_baseline =
+				(hrv_state.baseline * (HAPTIC_HRV_WARMUP_ALPHA_DEN - HAPTIC_HRV_WARMUP_ALPHA_NUM) +
+				 rmssd_fp * HAPTIC_HRV_WARMUP_ALPHA_NUM) /
+				HAPTIC_HRV_WARMUP_ALPHA_DEN;
+			/* Only allow downward movement — prevents early inflated RMSSD
+			 * values from permanently elevating the threshold. */
+			if (new_baseline < hrv_state.baseline) {
+				hrv_state.baseline = new_baseline;
+			}
+		}
+		hrv_state.warmup_count++;
+
+		static int64_t last_hrv_warmup_log;
+		int64_t now_w = k_uptime_get();
+
+		if ((now_w - last_hrv_warmup_log) >= 5000) {
+			LOG_INF("HRV: warming up (%u/%u) rmssd=%u baseline=%d",
+				hrv_state.warmup_count, HAPTIC_HRV_BASELINE_WARMUP,
+				rmssd, hrv_state.baseline / HAPTIC_HRV_BASELINE_SCALE);
+			last_hrv_warmup_log = now_w;
+		}
+		return;
+	}
+
+	/* Unscale BEFORE any update so spike readings never contaminate the
+	 * baseline used for threshold comparison or the log. */
+	int32_t baseline_ms = hrv_state.baseline / HAPTIC_HRV_BASELINE_SCALE;
+	int32_t threshold   = baseline_ms - (baseline_ms * HAPTIC_HRV_DROP_PCT / 100);
+
 	static int64_t last_hrv_log;
 	int64_t now = k_uptime_get();
 
 	if ((now - last_hrv_log) >= 5000) {
-		LOG_INF("HRV: rtor=%u ms  rmssd=%u ms  n=%u", rtor_ms, rmssd, hrv_rr_count);
+		LOG_INF("HRV: rtor=%u rmssd=%u baseline=%d threshold=%d stressed=%d",
+			rtor_ms, rmssd, baseline_ms, threshold, (int)hrv_state.stressed);
 		last_hrv_log = now;
 	}
 
-	if (rmssd > HAPTIC_HRV_RMSSD_THRESHOLD) {
+	static uint8_t hrv_below_count;
+	static bool    hrv_spike_recovery;
+
+	int32_t spike_threshold = baseline_ms + (baseline_ms * HAPTIC_HRV_SPIKE_PCT / 100);
+
+	/* Upward spike rejection — return before updating baseline so that spike
+	 * readings cannot inflate the baseline and raise the drop threshold. */
+	if ((int32_t)rmssd > spike_threshold) {
+		if (!hrv_spike_recovery) {
+			hrv_spike_recovery = true;
+			hrv_below_count    = 0;
+		}
+		LOG_INF("HRV: upward spike rejected rmssd=%u > spike_threshold=%d (baseline=%d)",
+			rmssd, spike_threshold, baseline_ms);
 		return;
 	}
-
-	if ((now - last_trigger_time) < HAPTIC_COOLDOWN_MS) {
-		return;
+	if (hrv_spike_recovery) {
+		LOG_INF("HRV: spike recovery cleared, rmssd=%u <= spike_threshold=%d",
+			rmssd, spike_threshold);
+		hrv_spike_recovery = false;
+		hrv_below_count    = 0;
 	}
 
-	last_trigger_time = now;
-	LOG_INF("HRV trigger: rmssd=%u ms <= %u", rmssd, HAPTIC_HRV_RMSSD_THRESHOLD);
-	k_work_submit(&haptic_hrv_alert_work);
+	/* Update baseline — only non-spike readings reach here. Freeze while stressed. */
+	if (!hrv_state.stressed) {
+		hrv_state.baseline = (hrv_state.baseline * (HAPTIC_BASELINE_ALPHA_DEN - HAPTIC_BASELINE_ALPHA_NUM) +
+				      (int32_t)rmssd * HAPTIC_HRV_BASELINE_SCALE * HAPTIC_BASELINE_ALPHA_NUM) /
+				     HAPTIC_BASELINE_ALPHA_DEN;
+	}
+
+	if ((int32_t)rmssd < threshold) {
+		hrv_below_count++;
+		if (hrv_below_count >= HAPTIC_HRV_DEBOUNCE_COUNT) {
+			if (!hrv_state.stressed) {
+				hrv_state.stressed      = true;
+				hrv_state.flagged_at_ms = k_uptime_get();
+				LOG_INF("HRV flagged: rmssd=%u < threshold=%d (baseline=%d) [debounce %u/%u]",
+					rmssd, threshold, baseline_ms,
+					hrv_below_count, HAPTIC_HRV_DEBOUNCE_COUNT);
+			}
+			haptic_check_combined();
+		}
+	} else {
+		if (hrv_below_count > 0) {
+			LOG_DBG("HRV: debounce reset (%u/%u), rmssd=%u recovered above threshold=%d",
+				hrv_below_count, HAPTIC_HRV_DEBOUNCE_COUNT, rmssd, threshold);
+		}
+		hrv_below_count         = 0;
+		hrv_state.stressed      = false;
+		hrv_state.flagged_at_ms = 0;
+	}
 }
 
 /* ------------------------------------------------------------------ */
-/* GSR-based trigger                                                   */
+/* GSR-based stress detection                                          */
 /* ------------------------------------------------------------------ */
-
-static void haptic_gsr_alert_work_handler(struct k_work *work)
-{
-	haptic_send_alert(1);
-}
-
-static K_WORK_DEFINE(haptic_gsr_alert_work, haptic_gsr_alert_work_handler);
 
 void haptic_process_gsr(const int32_t *samples, uint8_t num_samples, uint8_t lead_off)
 {
 	static int32_t gsr_prev_mean = INT32_MIN;
 	static int32_t gsr_ema       = INT32_MIN;
 	static uint16_t gsr_above_count;
+	static bool     gsr_spike_recovery;
 
 	if (num_samples == 0) {
 		return;
 	}
 
-	/* Skip when electrodes are not in contact */
+	/* Reset all state on lead-off — electrode environment has changed */
 	if (lead_off) {
-		gsr_prev_mean = INT32_MIN;
-		gsr_ema       = INT32_MIN;
-		gsr_above_count = 0;
+		gsr_prev_mean      = INT32_MIN;
+		gsr_ema            = INT32_MIN;
+		gsr_above_count    = 0;
+		gsr_spike_recovery = false;
+		gsr_state          = (struct haptic_sensor_state){0};
 		return;
 	}
 
-	/* Compute mean of this batch */
+	/* Compute batch mean */
 	int64_t sum = 0;
 
 	for (uint8_t i = 0; i < num_samples; i++) {
@@ -421,47 +649,135 @@ void haptic_process_gsr(const int32_t *samples, uint8_t num_samples, uint8_t lea
 	}
 	int32_t mean = (int32_t)(sum / num_samples);
 
-	/* Reject negative — capacitive/reactive artifact, not real conductance */
-	if (mean <= 0) {
-		gsr_prev_mean = INT32_MIN;
-		gsr_ema       = INT32_MIN;
-		gsr_above_count = 0;
+	/* Valid range gate — skip negatives and saturation artifacts, retain EMA */
+	if (mean < HAPTIC_GSR_MIN_VALID || mean > HAPTIC_GSR_MAX_VALID) {
 		return;
 	}
 
-	/* Reject motion artifacts — genuine stress rises slowly, spikes are instantaneous */
+	/* ROC motion rejection — only reject large upward spikes.
+	 * Downward movement is allowed freely: a falling GSR cannot cause a false
+	 * stress flag, and blocking drops prevents the boot transient from decaying. */
 	if (gsr_prev_mean != INT32_MIN) {
 		int32_t roc = mean - gsr_prev_mean;
 
-		if (roc < 0) {
-			roc = -roc;
-		}
 		if (roc > HAPTIC_GSR_ROC_THRESHOLD) {
-			LOG_DBG("GSR: motion rejected (roc=%d)", roc);
-			gsr_prev_mean = mean;
-			gsr_above_count = 0;
+			LOG_DBG("GSR: upward spike rejected (roc=%d)", roc);
+			gsr_prev_mean      = mean;
+			gsr_spike_recovery = true;
+			gsr_above_count    = 0;
 			return;
 		}
 	}
 	gsr_prev_mean = mean;
 
-	/* Exponential moving average — smooths residual noise */
+	/* Fast EMA — denoises before feeding into slow baseline.
+	 * Upward slew-rate limited: sudden contact spikes cannot propagate upward
+	 * faster than HAPTIC_GSR_EMA_MAX_DELTA per batch. Downward movement is
+	 * unrestricted so the boot transient decays quickly. */
 	if (gsr_ema == INT32_MIN) {
 		gsr_ema = mean;
 	} else {
-		gsr_ema = (gsr_ema * (HAPTIC_GSR_EMA_ALPHA_DEN - HAPTIC_GSR_EMA_ALPHA_NUM) +
-			   mean * HAPTIC_GSR_EMA_ALPHA_NUM) / HAPTIC_GSR_EMA_ALPHA_DEN;
+		int32_t new_ema = (gsr_ema * (HAPTIC_GSR_EMA_ALPHA_DEN - HAPTIC_GSR_EMA_ALPHA_NUM) +
+				   mean * HAPTIC_GSR_EMA_ALPHA_NUM) / HAPTIC_GSR_EMA_ALPHA_DEN;
+		int32_t delta = new_ema - gsr_ema;
+
+		if (delta > HAPTIC_GSR_EMA_MAX_DELTA) {
+			delta = HAPTIC_GSR_EMA_MAX_DELTA;
+		}
+		/* No downward limit — allows boot transient to decay naturally */
+		gsr_ema = gsr_ema + delta;
+
+		/* EMA ROC check — fast upward movement in the smoothed signal
+		 * indicates a sustained contact/conductance spike; suppress debounce
+		 * accumulation until the signal settles. */
+		if (delta > HAPTIC_GSR_EMA_ROC_THRESHOLD) {
+			LOG_DBG("GSR: EMA spike rejected (ema_delta=%d)", delta);
+			gsr_spike_recovery = true;
+			gsr_above_count    = 0;
+		}
 	}
+
+	/* Warmup — feed slow baseline from denoised EMA output.
+	 * Baseline stored scaled by HAPTIC_GSR_BASELINE_SCALE to preserve
+	 * sub-unit precision through the alpha=0.01 EMA. */
+	if (gsr_state.warmup_count < HAPTIC_GSR_BASELINE_WARMUP) {
+		gsr_state.baseline = (gsr_state.warmup_count == 0)
+			? gsr_ema * HAPTIC_GSR_BASELINE_SCALE
+			: (gsr_state.baseline * (HAPTIC_BASELINE_ALPHA_DEN - HAPTIC_BASELINE_ALPHA_NUM) +
+			   gsr_ema * HAPTIC_GSR_BASELINE_SCALE * HAPTIC_BASELINE_ALPHA_NUM) / HAPTIC_BASELINE_ALPHA_DEN;
+		gsr_state.warmup_count++;
+
+		int64_t now_w = k_uptime_get();
+		static int64_t last_gsr_warmup_log;
+
+		if ((now_w - last_gsr_warmup_log) >= 5000) {
+			LOG_INF("GSR: warming up (%u/%u) ema=%d baseline=%d",
+				gsr_state.warmup_count, HAPTIC_GSR_BASELINE_WARMUP,
+				gsr_ema, gsr_state.baseline / HAPTIC_GSR_BASELINE_SCALE);
+			last_gsr_warmup_log = now_w;
+		}
+		return;
+	}
+
+	/* Unscale baseline for comparisons and threshold computation */
+	int32_t baseline = gsr_state.baseline / HAPTIC_GSR_BASELINE_SCALE;
+
+	/* Update slow baseline — asymmetric tracking:
+	 * - Upward (ema >= baseline): alpha = 0.01 — tracks genuine long-term rises.
+	 * - Downward (ema < baseline): alpha = 0.001 — 10× slower, so temporary
+	 *   contact loss or dry-skin dips cannot drag the baseline to near-zero
+	 *   and create a false flag when skin contact recovers.
+	 * - Stressed: upward-only at alpha = 0.001 — prevents inflation during
+	 *   genuine stress events while still allowing slow recovery. */
+	if (!gsr_state.stressed) {
+		if (gsr_ema >= baseline) {
+			gsr_state.baseline = (gsr_state.baseline * (HAPTIC_BASELINE_ALPHA_DEN - HAPTIC_BASELINE_ALPHA_NUM) +
+					      gsr_ema * HAPTIC_GSR_BASELINE_SCALE * HAPTIC_BASELINE_ALPHA_NUM) / HAPTIC_BASELINE_ALPHA_DEN;
+		} else {
+			int32_t new_bl = (gsr_state.baseline * 999 + gsr_ema * HAPTIC_GSR_BASELINE_SCALE) / 1000;
+
+			if (new_bl < gsr_state.baseline) {
+				gsr_state.baseline = new_bl;
+			}
+		}
+	} else {
+		int32_t new_bl = (gsr_state.baseline * 999 + gsr_ema * HAPTIC_GSR_BASELINE_SCALE) / 1000;
+
+		if (new_bl > gsr_state.baseline) {
+			gsr_state.baseline = new_bl;
+		}
+	}
+
+	/* Re-read unscaled baseline after update */
+	baseline = gsr_state.baseline / HAPTIC_GSR_BASELINE_SCALE;
 
 	int64_t now = k_uptime_get();
-	static int64_t last_log_time;
+	static int64_t last_gsr_log;
 
-	if ((now - last_log_time) >= 5000) {
-		LOG_INF("GSR: raw=%d ema=%d", mean, gsr_ema);
-		last_log_time = now;
+	/* Threshold: baseline + 60% */
+	int32_t threshold = baseline + (baseline * HAPTIC_GSR_RISE_PCT / 100);
+
+	if ((now - last_gsr_log) >= 5000) {
+		LOG_INF("GSR: ema=%d baseline=%d threshold=%d stressed=%d",
+			gsr_ema, baseline, threshold, (int)gsr_state.stressed);
+		last_gsr_log = now;
 	}
 
-	if (gsr_ema < HAPTIC_GSR_THRESHOLD) {
+	/* Debounce: require sustained elevation above dynamic threshold */
+	if (gsr_ema < threshold) {
+		if (gsr_spike_recovery) {
+			LOG_DBG("GSR: spike recovery cleared, ema=%d < threshold=%d",
+				gsr_ema, threshold);
+			gsr_spike_recovery = false;
+		}
+		gsr_above_count         = 0;
+		gsr_state.stressed      = false;
+		gsr_state.flagged_at_ms = 0;
+		return;
+	}
+
+	/* Still above threshold: suppress debounce accumulation while in spike recovery */
+	if (gsr_spike_recovery) {
 		gsr_above_count = 0;
 		return;
 	}
@@ -471,25 +787,38 @@ void haptic_process_gsr(const int32_t *samples, uint8_t num_samples, uint8_t lea
 		return;
 	}
 
-	gsr_above_count = 0;
-
-	if ((now - last_trigger_time) < HAPTIC_COOLDOWN_MS) {
-		return;
+	/* Debounce satisfied — raise stress flag */
+	if (!gsr_state.stressed) {
+		gsr_state.stressed      = true;
+		gsr_state.flagged_at_ms = k_uptime_get();
+		LOG_INF("GSR flagged: ema=%d > threshold=%d (baseline=%d)",
+			gsr_ema, threshold, baseline);
 	}
 
-	last_trigger_time = now;
-	LOG_INF("GSR trigger: ema=%d >= %d (sustained)", gsr_ema, HAPTIC_GSR_THRESHOLD);
-	k_work_submit(&haptic_gsr_alert_work);
+	haptic_check_combined();
 }
+
+/* ------------------------------------------------------------------ */
+/* Module initialisation                                               */
+/* ------------------------------------------------------------------ */
 
 int haptic_module_init(void)
 {
-	dog_conn = NULL;
-	chr_handle_valid = false;
-	dog_chr_handle = 0;
+	dog_conn          = NULL;
+	chr_handle_valid  = false;
+	dog_chr_handle    = 0;
 	last_trigger_time = 0;
 
-	LOG_ERR("haptic: module init");
+	memset(&hr_state,  0, sizeof(hr_state));
+	memset(&gsr_state, 0, sizeof(gsr_state));
+	memset(&hrv_state, 0, sizeof(hrv_state));
+
+	hrv_rr_count = 0;
+	hrv_rr_head  = 0;
+
+	LOG_INF("haptic: module init — dynamic baseline (warmup HR=%u GSR=%u HRV=%u)",
+		HAPTIC_HR_BASELINE_WARMUP, HAPTIC_GSR_BASELINE_WARMUP, HAPTIC_HRV_BASELINE_WARMUP);
+
 	k_work_schedule(&scan_start_work, K_SECONDS(5));
 	return 0;
 }
