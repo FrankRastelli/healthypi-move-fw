@@ -355,42 +355,53 @@ static K_WORK_DEFINE(haptic_combined_alert_work, haptic_combined_alert_work_hand
 
 static void haptic_check_combined(void)
 {
-	if (!hr_state.stressed || !gsr_state.stressed || !hrv_state.stressed) {
-		return;
-	}
-
 	int64_t now = k_uptime_get();
 
 	if ((now - last_trigger_time) < HAPTIC_COOLDOWN_MS) {
 		return;
 	}
 
-	/* Find the oldest flag timestamp — all three must be within the window */
-	int64_t oldest = hr_state.flagged_at_ms;
+	struct haptic_sensor_state *sensors[3] = {
+		&hr_state, &gsr_state, &hrv_state
+	};
 
-	if (gsr_state.flagged_at_ms < oldest) {
-		oldest = gsr_state.flagged_at_ms;
-	}
-	if (hrv_state.flagged_at_ms < oldest) {
-		oldest = hrv_state.flagged_at_ms;
+	/* Count stressed sensors and find oldest flag among them */
+	uint8_t stressed_count = 0;
+	int64_t oldest = INT64_MAX;
+
+	for (int i = 0; i < 3; i++) {
+		if (sensors[i]->stressed) {
+			stressed_count++;
+			if (sensors[i]->flagged_at_ms < oldest) {
+				oldest = sensors[i]->flagged_at_ms;
+			}
+		}
 	}
 
+	/* Require at least 2 of 3 sensors stressed */
+	if (stressed_count < 2) {
+		return;
+	}
+
+	/* All stressed sensors must have flagged within the window */
 	if ((now - oldest) > HAPTIC_COMBINED_WINDOW_MS) {
 		return;
 	}
 
 	last_trigger_time = now;
-	LOG_INF("haptic: COMBINED TRIGGER — HR %lld ms ago, GSR %lld ms ago, HRV %lld ms ago",
-		(long long)(now - hr_state.flagged_at_ms),
-		(long long)(now - gsr_state.flagged_at_ms),
-		(long long)(now - hrv_state.flagged_at_ms));
+	LOG_INF("haptic: COMBINED TRIGGER (%u/3) —%s%s%s",
+		stressed_count,
+		hr_state.stressed  ? " HR"  : "",
+		gsr_state.stressed ? " GSR" : "",
+		hrv_state.stressed ? " HRV" : "");
 
-	hr_state.stressed      = false;
-	hr_state.flagged_at_ms = 0;
-	gsr_state.stressed      = false;
-	gsr_state.flagged_at_ms = 0;
-	hrv_state.stressed      = false;
-	hrv_state.flagged_at_ms = 0;
+	/* Reset only the sensors that contributed to this trigger */
+	for (int i = 0; i < 3; i++) {
+		if (sensors[i]->stressed) {
+			sensors[i]->stressed      = false;
+			sensors[i]->flagged_at_ms = 0;
+		}
+	}
 
 	k_work_submit(&haptic_combined_alert_work);
 }
