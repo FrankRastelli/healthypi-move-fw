@@ -48,6 +48,9 @@ static lv_obj_t *scr_hr;
 
 // GUI Labels
 static lv_obj_t *label_hr_bpm;
+static lv_obj_t *label_hr_baseline;
+static lv_obj_t *label_hr_threshold;
+static lv_obj_t *label_hr_stress_state;
 static lv_obj_t *label_hr_last_update_time;
 
 // Externs - Modern style system
@@ -127,21 +130,47 @@ void draw_scr_hr(enum scroll_dir m_scroll_dir)
     lv_obj_add_style(label_hr_unit, &style_body_medium, LV_PART_MAIN);
     lv_obj_set_style_pad_bottom(label_hr_unit, 8, LV_PART_MAIN);  // Align with number baseline
 
-    // LOWER: Last measurement time at y=210
+    // Baseline label
+    label_hr_baseline = lv_label_create(scr_hr);
+    lv_label_set_text(label_hr_baseline, "Baseline: -- BPM");
+    lv_obj_set_pos(label_hr_baseline, 0, 210);
+    lv_obj_set_width(label_hr_baseline, 390);
+    lv_obj_set_style_text_color(label_hr_baseline, lv_color_hex(COLOR_TEXT_SECONDARY), LV_PART_MAIN);
+    lv_obj_add_style(label_hr_baseline, &style_caption, LV_PART_MAIN);
+    lv_obj_set_style_text_align(label_hr_baseline, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    // Threshold label
+    label_hr_threshold = lv_label_create(scr_hr);
+    lv_label_set_text(label_hr_threshold, "Threshold: -- BPM");
+    lv_obj_set_pos(label_hr_threshold, 0, 235);
+    lv_obj_set_width(label_hr_threshold, 390);
+    lv_obj_set_style_text_color(label_hr_threshold, lv_color_hex(COLOR_TEXT_SECONDARY), LV_PART_MAIN);
+    lv_obj_add_style(label_hr_threshold, &style_caption, LV_PART_MAIN);
+    lv_obj_set_style_text_align(label_hr_threshold, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    // Stressed/Normal state label
+    label_hr_stress_state = lv_label_create(scr_hr);
+    lv_label_set_text(label_hr_stress_state, "");
+    lv_obj_set_pos(label_hr_stress_state, 0, 260);
+    lv_obj_set_width(label_hr_stress_state, 390);
+    lv_obj_add_style(label_hr_stress_state, &style_caption, LV_PART_MAIN);
+    lv_obj_set_style_text_align(label_hr_stress_state, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    // LOWER: Last measurement time
     label_hr_last_update_time = lv_label_create(scr_hr);
     char last_meas_str[25];
     hpi_helper_get_relative_time_str(last_update_ts, last_meas_str, sizeof(last_meas_str));
     lv_label_set_text(label_hr_last_update_time, last_meas_str);
-    lv_obj_set_pos(label_hr_last_update_time, 0, 210);
+    lv_obj_set_pos(label_hr_last_update_time, 0, 285);
     lv_obj_set_width(label_hr_last_update_time, 390);
     lv_obj_set_style_text_color(label_hr_last_update_time, lv_color_hex(COLOR_TEXT_SECONDARY), LV_PART_MAIN);
     lv_obj_add_style(label_hr_last_update_time, &style_caption, LV_PART_MAIN);
     lv_obj_set_style_text_align(label_hr_last_update_time, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 
-    // BOTTOM: Single centered "Raw PPG" button at y=250
+    // BOTTOM: Single centered "Raw PPG" button
     const int btn_width = 200;
     const int btn_height = 60;
-    const int btn_y = 250;
+    const int btn_y = 315;
 
     lv_obj_t *btn_raw_ppg = hpi_btn_create_primary(scr_hr);
     lv_obj_set_size(btn_raw_ppg, btn_width, btn_height);
@@ -163,18 +192,35 @@ void draw_scr_hr(enum scroll_dir m_scroll_dir)
     hpi_show_screen(scr_hr, m_scroll_dir);
 }
 
-void hpi_disp_hr_update_hr(uint16_t hr, int64_t last_update_ts)
+void hpi_disp_hr_update_hr(uint16_t hr, int32_t baseline, int32_t threshold, bool stressed, int64_t last_update_ts)
 {
     if (label_hr_bpm == NULL)
         return;
 
-    if (hr == 0)
-    {
+    if (hr == 0) {
         lv_label_set_text(label_hr_bpm, "--");
-    }
-    else
-    {
+    } else {
         lv_label_set_text_fmt(label_hr_bpm, "%d", hr);
+    }
+
+    if (label_hr_baseline != NULL && baseline > 0) {
+        lv_label_set_text_fmt(label_hr_baseline, "Baseline: %d BPM", baseline);
+    }
+
+    if (label_hr_threshold != NULL && threshold > 0) {
+        lv_label_set_text_fmt(label_hr_threshold, "Threshold: %d BPM", threshold);
+    }
+
+    if (label_hr_stress_state != NULL) {
+        if (stressed) {
+            lv_label_set_text(label_hr_stress_state, "Stressed");
+            lv_obj_set_style_text_color(label_hr_stress_state,
+                                         lv_color_hex(COLOR_CRITICAL_RED), LV_PART_MAIN);
+        } else {
+            lv_label_set_text(label_hr_stress_state, "Normal");
+            lv_obj_set_style_text_color(label_hr_stress_state,
+                                         lv_color_hex(COLOR_SUCCESS_GREEN), LV_PART_MAIN);
+        }
     }
 
     if (label_hr_last_update_time != NULL) {

@@ -368,5 +368,39 @@ struct hpi_hrv_status_t
     bool active;        // Current HRV measurement status
 };
 
+/* Published by haptic_module when combined stress trigger fires */
+struct hpi_haptic_alert_t {
+    uint8_t  sensors_triggered; /* bitmask: bit0=HR, bit1=GSR, bit2=HRV */
+    uint8_t  count;             /* number of sensors that triggered (2 or 3) */
+};
+
+/* Published by haptic_module after each RMSSD computation */
+struct hpi_haptic_hrv_t {
+    uint32_t rmssd;          /* current RMSSD in ms */
+    int32_t  baseline;       /* current RMSSD baseline in ms */
+    int32_t  threshold;      /* stress threshold (baseline × drop%) in ms */
+    bool     stressed;       /* current HRV stress state */
+    uint16_t rr_buf[60];     /* RR interval history (oldest to newest, ms) */
+    uint8_t  rr_count;       /* valid entries in rr_buf */
+};
+
+/* Published by haptic_module after each HR sample (post-warmup) */
+struct hpi_haptic_hr_t {
+    uint16_t hr;             /* current heart rate in BPM */
+    int32_t  baseline;       /* current HR baseline in BPM */
+    int32_t  threshold;      /* stress threshold (baseline + rise%) in BPM */
+    bool     stressed;       /* current HR stress state */
+};
+
+/* Published by haptic_module after each processed GSR batch */
+struct hpi_haptic_gsr_t {
+    int32_t  ema;            /* current EMA (µS × 100) */
+    int32_t  baseline;       /* current baseline (µS × 100) */
+    int32_t  threshold;      /* current stress threshold (µS × 100) */
+    bool     stressed;       /* current GSR stress state */
+    int32_t  ema_buf[60];    /* EMA history (oldest to newest, µS × 100) */
+    uint8_t  buf_count;      /* valid entries in ema_buf */
+};
+
 
 

@@ -560,30 +560,14 @@ void hpi_load_screen(int m_screen, enum scroll_dir m_scroll_dir)
     case SCR_HR:
         draw_scr_hr(m_scroll_dir);
         break;
-    case SCR_SPO2:
-        draw_scr_spo2(m_scroll_dir);
-        break;
-    case SCR_BPT:
-        draw_scr_bpt(m_scroll_dir);
-        break;
     case SCR_TEMP:
         draw_scr_temp(m_scroll_dir);
-        break;
-    case SCR_ECG:
-        draw_scr_ecg(m_scroll_dir);
         break;
     case SCR_HRV:
         draw_scr_hrv(m_scroll_dir, 0, 0, 0, 0);
         break;
     case SCR_GSR:
-#if defined(CONFIG_HPI_GSR_SCREEN)
         draw_scr_gsr(m_scroll_dir);
-#else
-    printk("GSR screen disabled by config\n");
-#endif
-        break;
-    case SCR_RECORDING:
-        draw_scr_recording(m_scroll_dir);
         break;
 
     /*case SCR_PLOT_EDA:

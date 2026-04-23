@@ -13,15 +13,14 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(healthypi_move)
 
-FILE(GLOB app_sources   src/*.c 
-                        src/images/*.c 
-                        src/ui/*.c 
+FILE(GLOB app_sources CONFIGURE_DEPENDS
+                        src/*.c
+                        src/images/*.c
+                        src/ui/*.c
                         src/ui/components/*.c
                         src/ui/images/*.c
                         src/ui/fonts/*.c
                         src/ui/fonts/lvgl/*.c
-                        src/ui/screens/*.c
-                        src/ui/screens/*.c
                         src/ui/screens/*.c
                         src/sm/*.c)  
 

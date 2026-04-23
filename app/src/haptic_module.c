@@ -19,6 +19,8 @@
 #include "haptic_module.h"
 #include "hpi_common_types.h"
 
+ZBUS_CHAN_DECLARE(haptic_alert_chan, haptic_hrv_chan, haptic_gsr_chan, haptic_hr_chan);
+
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
@@ -126,6 +128,23 @@ static int64_t last_trigger_time;
 static uint16_t hrv_rr_buf[HAPTIC_HRV_WINDOW];
 static uint8_t  hrv_rr_count;
 static uint8_t  hrv_rr_head;
+
+/* ------------------------------------------------------------------ */
+/* Display history buffers (for live plot screens)                     */
+/* ------------------------------------------------------------------ */
+
+#define HAPTIC_DISPLAY_BUF_SIZE 60
+
+static uint16_t hrv_display_buf[HAPTIC_DISPLAY_BUF_SIZE];
+static uint8_t  hrv_display_head;
+static uint8_t  hrv_display_count;
+
+/* ------------------------------------------------------------------ */
+/* Alert bitmask captured before sensor reset (for zbus publish)       */
+/* ------------------------------------------------------------------ */
+
+static uint8_t last_alert_bitmask;
+static uint8_t last_alert_count;
 
 /* ------------------------------------------------------------------ */
 /* Scanning                                                            */
@@ -344,6 +363,12 @@ int haptic_send_alert(uint8_t value)
 
 static void haptic_combined_alert_work_handler(struct k_work *work)
 {
+	struct hpi_haptic_alert_t alert = {
+		.sensors_triggered = last_alert_bitmask,
+		.count             = last_alert_count,
+	};
+	zbus_chan_pub(&haptic_alert_chan, &alert, K_NO_WAIT);
+
 	haptic_send_alert(1);
 }
 
@@ -394,6 +419,12 @@ static void haptic_check_combined(void)
 		hr_state.stressed  ? " HR"  : "",
 		gsr_state.stressed ? " GSR" : "",
 		hrv_state.stressed ? " HRV" : "");
+
+	/* Capture bitmask before resetting sensors so work handler can publish it */
+	last_alert_bitmask = (hr_state.stressed  ? BIT(0) : 0) |
+	                     (gsr_state.stressed ? BIT(1) : 0) |
+	                     (hrv_state.stressed ? BIT(2) : 0);
+	last_alert_count   = stressed_count;
 
 	/* Reset only the sensors that contributed to this trigger */
 	for (int i = 0; i < 3; i++) {
@@ -476,6 +507,17 @@ static void haptic_hr_listener(const struct zbus_channel *chan)
 	}
 
 	haptic_check_combined();
+
+	/* Publish HR data to display layer */
+	{
+		struct hpi_haptic_hr_t hr_msg = {
+			.hr        = (uint16_t)current_hr,
+			.baseline  = hr_state.baseline,
+			.threshold = threshold,
+			.stressed  = hr_state.stressed,
+		};
+		zbus_chan_pub(&haptic_hr_chan, &hr_msg, K_NO_WAIT);
+	}
 }
 
 ZBUS_LISTENER_DEFINE(haptic_hr_lis, haptic_hr_listener);
@@ -560,6 +602,13 @@ void haptic_process_rtor(uint16_t rtor_ms)
 		return;
 	}
 
+	/* Push to display history buffer */
+	hrv_display_buf[hrv_display_head] = (uint16_t)rmssd;
+	hrv_display_head = (hrv_display_head + 1) % HAPTIC_DISPLAY_BUF_SIZE;
+	if (hrv_display_count < HAPTIC_DISPLAY_BUF_SIZE) {
+		hrv_display_count++;
+	}
+
 	/* Unscale BEFORE any update so spike readings never contaminate the
 	 * baseline used for threshold comparison or the log. */
 	int32_t baseline_ms = hrv_state.baseline / HAPTIC_HRV_BASELINE_SCALE;
@@ -572,6 +621,23 @@ void haptic_process_rtor(uint16_t rtor_ms)
 		LOG_INF("HRV: rtor=%u rmssd=%u baseline=%d threshold=%d stressed=%d",
 			rtor_ms, rmssd, baseline_ms, threshold, (int)hrv_state.stressed);
 		last_hrv_log = now;
+	}
+
+	/* Publish live HRV data to display layer */
+	{
+		struct hpi_haptic_hrv_t hrv_msg = {
+			.rmssd     = rmssd,
+			.baseline  = baseline_ms,
+			.threshold = threshold,
+			.stressed  = hrv_state.stressed,
+			.rr_count  = 0,
+		};
+		for (uint8_t i = 0; i < hrv_display_count && hrv_msg.rr_count < HAPTIC_DISPLAY_BUF_SIZE; i++) {
+			uint8_t idx = (hrv_display_head - hrv_display_count + i +
+				       HAPTIC_DISPLAY_BUF_SIZE) % HAPTIC_DISPLAY_BUF_SIZE;
+			hrv_msg.rr_buf[hrv_msg.rr_count++] = hrv_display_buf[idx];
+		}
+		zbus_chan_pub(&haptic_hrv_chan, &hrv_msg, K_NO_WAIT);
 	}
 
 	static uint8_t hrv_below_count;
@@ -774,6 +840,33 @@ void haptic_process_gsr(const int32_t *samples, uint8_t num_samples, uint8_t lea
 		last_gsr_log = now;
 	}
 
+	/* Publish live GSR data to display layer */
+	{
+		static int32_t gsr_disp_buf[HAPTIC_DISPLAY_BUF_SIZE];
+		static uint8_t gsr_disp_head;
+		static uint8_t gsr_disp_count;
+
+		gsr_disp_buf[gsr_disp_head] = gsr_ema;
+		gsr_disp_head = (gsr_disp_head + 1) % HAPTIC_DISPLAY_BUF_SIZE;
+		if (gsr_disp_count < HAPTIC_DISPLAY_BUF_SIZE) {
+			gsr_disp_count++;
+		}
+
+		struct hpi_haptic_gsr_t gsr_msg = {
+			.ema       = gsr_ema,
+			.baseline  = baseline,
+			.threshold = threshold,
+			.stressed  = gsr_state.stressed,
+			.buf_count = 0,
+		};
+		for (uint8_t i = 0; i < gsr_disp_count && gsr_msg.buf_count < HAPTIC_DISPLAY_BUF_SIZE; i++) {
+			uint8_t idx = (gsr_disp_head - gsr_disp_count + i +
+				       HAPTIC_DISPLAY_BUF_SIZE) % HAPTIC_DISPLAY_BUF_SIZE;
+			gsr_msg.ema_buf[gsr_msg.buf_count++] = gsr_disp_buf[idx];
+		}
+		zbus_chan_pub(&haptic_gsr_chan, &gsr_msg, K_NO_WAIT);
+	}
+
 	/* Debounce: require sustained elevation above dynamic threshold */
 	if (gsr_ema < threshold) {
 		if (gsr_spike_recovery) {
@@ -826,6 +919,12 @@ int haptic_module_init(void)
 
 	hrv_rr_count = 0;
 	hrv_rr_head  = 0;
+
+	hrv_display_count = 0;
+	hrv_display_head  = 0;
+
+	last_alert_bitmask = 0;
+	last_alert_count   = 0;
 
 	LOG_INF("haptic: module init — dynamic baseline (warmup HR=%u GSR=%u HRV=%u)",
 		HAPTIC_HR_BASELINE_WARMUP, HAPTIC_GSR_BASELINE_WARMUP, HAPTIC_HRV_BASELINE_WARMUP);
