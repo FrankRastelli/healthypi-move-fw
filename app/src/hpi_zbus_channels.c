@@ -137,3 +137,32 @@ ZBUS_CHAN_DEFINE(recording_status_chan,
                  NULL,
                  ZBUS_OBSERVERS(disp_recording_lis),
                  ZBUS_MSG_INIT(0));
+
+// Haptic module → display channels (stress detection results)
+ZBUS_CHAN_DEFINE(haptic_alert_chan,
+                 struct hpi_haptic_alert_t,
+                 NULL,
+                 NULL,
+                 ZBUS_OBSERVERS(disp_haptic_alert_lis),
+                 ZBUS_MSG_INIT(0));
+
+ZBUS_CHAN_DEFINE(haptic_hrv_chan,
+                 struct hpi_haptic_hrv_t,
+                 NULL,
+                 NULL,
+                 ZBUS_OBSERVERS(disp_haptic_hrv_lis),
+                 ZBUS_MSG_INIT(0));
+
+ZBUS_CHAN_DEFINE(haptic_gsr_chan,
+                 struct hpi_haptic_gsr_t,
+                 NULL,
+                 NULL,
+                 ZBUS_OBSERVERS(disp_haptic_gsr_lis),
+                 ZBUS_MSG_INIT(0));
+
+ZBUS_CHAN_DEFINE(haptic_hr_chan,
+                 struct hpi_haptic_hr_t,
+                 NULL,
+                 NULL,
+                 ZBUS_OBSERVERS(disp_haptic_hr_lis),
+                 ZBUS_MSG_INIT(0));

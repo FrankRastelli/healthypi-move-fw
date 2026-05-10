@@ -195,6 +195,22 @@ extern struct k_sem sem_fi_spo2_est_cancel;
 static struct hpi_recording_status_t m_disp_recording_status = {0};
 static bool m_disp_recording_status_updated = false;
 
+// @brief Haptic HRV data (updated by ZBus listener from haptic_module)
+static struct hpi_haptic_hrv_t m_disp_haptic_hrv = {0};
+static bool m_disp_haptic_hrv_updated = false;
+
+// @brief Haptic GSR data (updated by ZBus listener from haptic_module)
+static struct hpi_haptic_gsr_t m_disp_haptic_gsr = {0};
+static bool m_disp_haptic_gsr_updated = false;
+
+// @brief Haptic HR data (updated by ZBus listener from haptic_module)
+static struct hpi_haptic_hr_t m_disp_haptic_hr = {0};
+static bool m_disp_haptic_hr_updated = false;
+
+// @brief Haptic alert (updated by ZBus listener from haptic_module)
+static bool m_disp_haptic_alert_fired = false;
+static struct tm m_disp_haptic_alert_time = {0};
+
 struct s_disp_object
 {
     struct smf_ctx ctx;
@@ -228,12 +244,13 @@ K_MUTEX_DEFINE(mutex_curr_screen);
 static const screen_func_table_entry_t screen_func_table[] = {
     [SCR_HOME] = {draw_scr_home, NULL},
     [SCR_HR] = {draw_scr_hr, NULL},
-    [SCR_SPO2] = {draw_scr_spo2, NULL},
-    [SCR_ECG] = {draw_scr_ecg, NULL},
     [SCR_TEMP] = {draw_scr_temp, NULL},
-    [SCR_BPT] = {draw_scr_bpt, NULL},
     [SCR_GSR] = {draw_scr_gsr, NULL},
     [SCR_HRV] = {draw_scr_hrv, NULL},
+    /* Non-carousel screens kept for SMF compatibility */
+    [SCR_SPO2] = {draw_scr_spo2, NULL},
+    [SCR_ECG] = {draw_scr_ecg, NULL},
+    [SCR_BPT] = {draw_scr_bpt, NULL},
     [SCR_RECORDING] = {draw_scr_recording, NULL},
     [SCR_SPL_RAW_PPG] = {draw_scr_spl_raw_ppg, gesture_down_scr_spl_raw_ppg},
     [SCR_SPL_ECG_SCR2] = {draw_scr_ecg_scr2, gesture_down_scr_ecg_2},
@@ -260,6 +277,9 @@ static const screen_func_table_entry_t screen_func_table[] = {
     [SCR_SPL_BPT_FAILED] = {draw_scr_bpt_cal_failed, gesture_down_scr_bpt_cal_failed},
     [SCR_SPL_BPT_EST_COMPLETE] = {draw_scr_bpt_est_complete, gesture_down_scr_bpt_est_complete},
     [SCR_SPL_BPT_CAL_REQUIRED] = {draw_scr_bpt_cal_required, gesture_down_scr_bpt_cal_required},
+
+    [SCR_SPL_RR_PLOT]       = {draw_scr_rr_plot,       gesture_down_scr_rr_plot},
+    [SCR_SPL_GSR_LIVE_PLOT] = {draw_scr_gsr_live_plot,  gesture_down_scr_gsr_live_plot},
 
     [SCR_SPL_BLE] = {draw_scr_ble, NULL},
     [SCR_SPL_PULLDOWN] = {draw_scr_pulldown, gesture_down_scr_pulldown},
@@ -557,7 +577,7 @@ void disp_screen_event(lv_event_t *e)
 
         if (hpi_disp_get_curr_screen() == SCR_SPL_SPO2_MEASURE)
         {
-            hpi_load_screen(SCR_SPO2, SCROLL_LEFT);
+            hpi_load_screen(SCR_HOME, SCROLL_LEFT);
             return;
         }
 
@@ -1043,27 +1063,58 @@ static void hpi_disp_update_screens(void)
             last_temp_trend_refresh = k_uptime_get_32();
         }
         break;
-    case SCR_GSR:
-#if defined(CONFIG_HPI_GSR_SCREEN)
-        if (k_uptime_get_32() - last_temp_trend_refresh > HPI_DISP_TEMP_REFRESH_INT)
-        {
-            uint16_t gsr_value = 0;
-            int64_t gsr_last_update = 0;
-            if (hpi_sys_get_last_gsr_update(&gsr_value, &gsr_last_update) == 0 && gsr_value > 0)
-            {
-                // Use integer-only function for flash optimization
-                hpi_gsr_disp_update_gsr_int(gsr_value, gsr_last_update);
-            }
-            last_temp_trend_refresh = k_uptime_get_32();
-        }
-#endif
-        break;
     case SCR_HR:
-        if (m_disp_hr > 0)
+        if (m_disp_haptic_hr_updated)
         {
-            hpi_disp_hr_update_hr(m_disp_hr, m_disp_hr_updated_ts);
+            m_disp_haptic_hr_updated = false;
+            hpi_disp_hr_update_hr(m_disp_haptic_hr.hr,
+                                  m_disp_haptic_hr.baseline,
+                                  m_disp_haptic_hr.threshold,
+                                  m_disp_haptic_hr.stressed,
+                                  m_disp_hr_updated_ts);
         }
         last_hr_trend_refresh = k_uptime_get_32();
+        break;
+    case SCR_HRV:
+        if (m_disp_haptic_hrv_updated)
+        {
+            m_disp_haptic_hrv_updated = false;
+            hpi_disp_hrv_update(m_disp_haptic_hrv.rmssd,
+                                m_disp_haptic_hrv.baseline,
+                                m_disp_haptic_hrv.threshold,
+                                m_disp_haptic_hrv.stressed);
+        }
+        break;
+    case SCR_GSR:
+        if (m_disp_haptic_gsr_updated)
+        {
+            m_disp_haptic_gsr_updated = false;
+            hpi_disp_gsr_update(m_disp_haptic_gsr.ema,
+                                m_disp_haptic_gsr.baseline,
+                                m_disp_haptic_gsr.threshold,
+                                m_disp_haptic_gsr.stressed);
+        }
+        break;
+    case SCR_SPL_RR_PLOT:
+        if (m_disp_haptic_hrv_updated)
+        {
+            m_disp_haptic_hrv_updated = false;
+            hpi_disp_hrv_update(m_disp_haptic_hrv.rmssd,
+                                m_disp_haptic_hrv.baseline,
+                                m_disp_haptic_hrv.threshold,
+                                m_disp_haptic_hrv.stressed);
+            hpi_disp_rr_plot_update(m_disp_haptic_hrv.rr_buf,
+                                    m_disp_haptic_hrv.rr_count);
+        }
+        break;
+    case SCR_SPL_GSR_LIVE_PLOT:
+        if (m_disp_haptic_gsr_updated)
+        {
+            m_disp_haptic_gsr_updated = false;
+            hpi_disp_gsr_live_plot_update(m_disp_haptic_gsr.ema_buf,
+                                          m_disp_haptic_gsr.buf_count,
+                                          m_disp_haptic_gsr.threshold);
+        }
         break;
     case SCR_SPL_HR_SCR2:
         if ((k_uptime_get_32() - last_hr_trend_refresh) > HPI_DISP_TRENDS_REFRESH_INT)
@@ -1072,19 +1123,11 @@ static void hpi_disp_update_screens(void)
             last_hr_trend_refresh = k_uptime_get_32();
         }
         break;
-    case SCR_SPO2:
-        if ((k_uptime_get_32() - last_spo2_trend_refresh) > HPI_DISP_TRENDS_REFRESH_INT)
-        {
-            // hpi_disp_update_spo2(m_disp_spo2, m_disp_spo2_last_refresh_tm);
-            // hpi_disp_spo2_load_trend();
-            last_spo2_trend_refresh = k_uptime_get_32();
-        }
-        break;
     case  SCR_SPL_BPT_MEASURE:
         if(k_sem_take(&sem_finger_contact_timeout, K_NO_WAIT) == 0)
         {
-            LOG_INF("DISPLAY THREAD: Finger contact timeout - returning to BPT home screen");
-            hpi_load_screen(SCR_BPT, SCROLL_DOWN);
+            LOG_INF("DISPLAY THREAD: Finger contact timeout");
+            hpi_load_screen(SCR_HOME, SCROLL_DOWN);
             hpi_disp_show_toast("Measurement cancelled\nNo finger detected", 3000);
         }
         break;
@@ -1092,19 +1135,18 @@ static void hpi_disp_update_screens(void)
          if(k_sem_take(&sem_fi_bpt_cal_cancel, K_NO_WAIT) == 0)
          {
             hpi_bpt_abort();
-            hpi_load_screen(SCR_BPT, SCROLL_NONE);
+            hpi_load_screen(SCR_HOME, SCROLL_NONE);
             return;
          }
         lv_disp_trig_activity(NULL);
         break;
     case SCR_SPL_SPO2_MEASURE:
-
          if(k_sem_take(&sem_finger_contact_timeout, K_NO_WAIT) == 0)
          {
-            LOG_INF("DISPLAY THREAD: Finger contact timeout - returning to SpO2 home screen");
-            hpi_load_screen(SCR_SPO2, SCROLL_DOWN);
+            LOG_INF("DISPLAY THREAD: Finger contact timeout - returning home");
+            hpi_load_screen(SCR_HOME, SCROLL_DOWN);
             hpi_disp_show_toast("Measurement cancelled\nNo finger detected", 3000);
-         }        
+         }
         lv_disp_trig_activity(NULL);
         break;
     case SCR_SPL_HRV_EVAL_PROGRESS:
@@ -1156,9 +1198,9 @@ static void hpi_disp_update_screens(void)
         // (signaled by ECG SMF when user doesn't place leads within timeout)
         if (k_sem_take(&sem_ecg_lead_timeout, K_NO_WAIT) == 0)
         {
-            LOG_INF("DISPLAY THREAD: Lead placement timeout - returning to ECG home screen");
+            LOG_INF("DISPLAY THREAD: Lead placement timeout - returning home");
             unload_scr_ecg_scr2();
-            hpi_load_screen(SCR_ECG, SCROLL_DOWN);
+            hpi_load_screen(SCR_HOME, SCROLL_DOWN);
             hpi_disp_show_toast("Measurement cancelled\nNo leads detected", 3000);
             break;
         }
@@ -1408,10 +1450,14 @@ static void st_display_active_run(void *o)
         {
             hpi_scr_home_update_recording_status(&m_disp_recording_status);
         }
-        else if (curr_screen == SCR_RECORDING)
-        {
-            hpi_scr_recording_update_status(&m_disp_recording_status);
-        }
+    }
+
+    // Handle haptic alert notification
+    if (m_disp_haptic_alert_fired)
+    {
+        m_disp_haptic_alert_fired = false;
+        hpi_disp_show_toast("Stress alert sent", 3000);
+        hpi_home_update_last_alert(m_disp_haptic_alert_time);
     }
 
     // Add button handlers
@@ -1446,10 +1492,7 @@ static void st_display_active_run(void *o)
         {
             gesture_down_scr_gsr_plot();
         }
-        else
-        {
-            hpi_load_screen(SCR_HOME, SCROLL_NONE);
-        }
+        /* No default: crown key does not navigate away from other screens */
     }
 
     if (k_sem_take(&sem_change_screen, K_NO_WAIT) == 0)
@@ -1768,6 +1811,45 @@ static void disp_recording_listener(const struct zbus_channel *chan)
     m_disp_recording_status_updated = true;
 }
 ZBUS_LISTENER_DEFINE(disp_recording_lis, disp_recording_listener);
+
+// Haptic alert listener — captures alert time, sets flag for display thread
+static void disp_haptic_alert_listener(const struct zbus_channel *chan)
+{
+    ARG_UNUSED(chan);
+    m_disp_haptic_alert_time  = m_disp_sys_time;
+    m_disp_haptic_alert_fired = true;
+}
+ZBUS_LISTENER_DEFINE(disp_haptic_alert_lis, disp_haptic_alert_listener);
+
+// HRV live data listener
+static void disp_haptic_hrv_listener(const struct zbus_channel *chan)
+{
+    const struct hpi_haptic_hrv_t *hrv = zbus_chan_const_msg(chan);
+    if (!hrv) return;
+    m_disp_haptic_hrv         = *hrv;
+    m_disp_haptic_hrv_updated = true;
+}
+ZBUS_LISTENER_DEFINE(disp_haptic_hrv_lis, disp_haptic_hrv_listener);
+
+// GSR live data listener
+static void disp_haptic_gsr_listener(const struct zbus_channel *chan)
+{
+    const struct hpi_haptic_gsr_t *gsr = zbus_chan_const_msg(chan);
+    if (!gsr) return;
+    m_disp_haptic_gsr         = *gsr;
+    m_disp_haptic_gsr_updated = true;
+}
+ZBUS_LISTENER_DEFINE(disp_haptic_gsr_lis, disp_haptic_gsr_listener);
+
+// HR stress data listener
+static void disp_haptic_hr_listener(const struct zbus_channel *chan)
+{
+    const struct hpi_haptic_hr_t *hr = zbus_chan_const_msg(chan);
+    if (!hr) return;
+    m_disp_haptic_hr         = *hr;
+    m_disp_haptic_hr_updated = true;
+}
+ZBUS_LISTENER_DEFINE(disp_haptic_hr_lis, disp_haptic_hr_listener);
 
 #define SMF_DISPLAY_THREAD_STACK_SIZE 24576
 #define SMF_DISPLAY_THREAD_PRIORITY 5

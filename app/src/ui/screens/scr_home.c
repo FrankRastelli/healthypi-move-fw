@@ -71,6 +71,7 @@ static lv_obj_t *ui_home_label_ampm = NULL;
 static lv_obj_t *label_home_batt_val = NULL;  // Renamed to avoid conflicts with other screens
 static lv_obj_t *label_recording_status = NULL;  // Recording indicator
 static lv_obj_t *label_time_not_set = NULL;  // Time not set reminder
+static lv_obj_t *label_home_last_alert = NULL;  // Last stress alert indicator
 
 // LVGL delete event callback - called when LVGL auto-deletes this screen
 static void scr_home_delete_event_cb(lv_event_t *e)
@@ -86,13 +87,8 @@ static void scr_home_delete_event_cb(lv_event_t *e)
     // Reset state
     quick_actions_visible = false;
     
-    // CRITICAL: NULL the main screen pointer immediately  
-    // This allows the update function check (scr_home != NULL) to work correctly
     scr_home = NULL;
-    
-    // NOTE: We don't NULL child object pointers here because LVGL handles them automatically
-    // when it deletes the parent screen. They'll become dangling but that's OK because
-    // the update functions check (scr_home != NULL || child == NULL) before using them.
+    label_home_last_alert = NULL;
 }
 
 // Cleanup function to prevent memory issues during screen transitions
@@ -442,6 +438,15 @@ void draw_scr_home(enum scroll_dir m_scroll_dir)
     lv_obj_set_style_text_align(label_recording_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_add_flag(label_recording_status, LV_OBJ_FLAG_HIDDEN);  // Hidden by default
 
+    // Last alert indicator - positioned below recording status, hidden by default
+    label_home_last_alert = lv_label_create(scr_home);
+    lv_label_set_text(label_home_last_alert, "");
+    lv_obj_align(label_home_last_alert, LV_ALIGN_CENTER, 0, -80);  // Below recording indicator
+    lv_obj_set_style_text_color(label_home_last_alert, lv_color_hex(COLOR_WARNING_AMBER), LV_PART_MAIN);
+    lv_obj_set_style_text_font(label_home_last_alert, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_align(label_home_last_alert, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_add_flag(label_home_last_alert, LV_OBJ_FLAG_HIDDEN);  // Hidden until first alert
+
     // Time not set reminder - positioned at bottom, hidden when time is valid
     label_time_not_set = lv_label_create(scr_home);
     lv_label_set_text(label_time_not_set, LV_SYMBOL_WARNING " Set time from app");
@@ -579,4 +584,19 @@ void hpi_scr_home_update_recording_status(struct hpi_recording_status_t *status)
         // Hide indicator when not recording
         lv_obj_add_flag(label_recording_status, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+void hpi_home_update_last_alert(struct tm alert_time)
+{
+    if (label_home_last_alert == NULL || scr_home == NULL) {
+        return;
+    }
+    if (!lv_obj_is_valid(label_home_last_alert)) {
+        label_home_last_alert = NULL;
+        return;
+    }
+
+    lv_label_set_text_fmt(label_home_last_alert, LV_SYMBOL_WARNING " Alert %02d:%02d",
+                           alert_time.tm_hour, alert_time.tm_min);
+    lv_obj_clear_flag(label_home_last_alert, LV_OBJ_FLAG_HIDDEN);
 }

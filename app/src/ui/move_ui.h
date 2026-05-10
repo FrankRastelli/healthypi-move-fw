@@ -114,17 +114,18 @@ enum hpi_disp_screens
     SCR_TODAY,
 #endif
     SCR_HR,
-    SCR_SPO2,
-    SCR_ECG,
-    SCR_TEMP,
-    SCR_BPT,
     SCR_HRV,
     SCR_GSR,
-    SCR_RECORDING,  // Background recording control
-    //SCR_HRV,
+    SCR_TEMP,
     SCR_LIST_END,
-    // Should not go here
-    
+
+    /* Screens below are NOT in the swipe carousel but keep their enum values
+     * so that existing SMF modules (ppg_finger, ppg_wrist) that reference them
+     * as "return-to" parent arguments continue to compile. */
+    SCR_SPO2,
+    SCR_ECG,
+    SCR_BPT,
+    SCR_RECORDING,
 };
 
 // Special screens
@@ -174,6 +175,9 @@ enum hpi_disp_spl_screens
     SCR_SPL_TIME_FORMAT_SELECT,
     SCR_SPL_TEMP_UNIT_SELECT,
     SCR_SPL_SLEEP_TIMEOUT_SELECT,
+
+    SCR_SPL_RR_PLOT,        /* Live RR interval history chart */
+    SCR_SPL_GSR_LIVE_PLOT,  /* Live GSR EMA chart with threshold overlay */
 
     SCR_SPL_LIST_END,
 
@@ -307,6 +311,7 @@ void hpi_scr_home_update_time_date(struct tm in_time);
 void hpi_home_hr_update(int hr);
 void hpi_home_steps_update(int steps);
 void hpi_scr_home_update_recording_status(struct hpi_recording_status_t *status);
+void hpi_home_update_last_alert(struct tm alert_time);
 
 #if defined(CONFIG_HPI_TODAY_SCREEN)
 // Today Screen functions
@@ -316,7 +321,7 @@ void hpi_scr_today_update_all(uint16_t steps, uint16_t kcals, uint16_t active_ti
 
 // HR Screen functions
 void draw_scr_hr(enum scroll_dir m_scroll_dir);
-void hpi_disp_hr_update_hr(uint16_t hr, int64_t last_update_ts);
+void hpi_disp_hr_update_hr(uint16_t hr, int32_t baseline, int32_t threshold, bool stressed, int64_t last_update_ts);
 void hpi_disp_hr_load_trend(void);
 void draw_scr_hr_scr2(enum scroll_dir m_scroll_dir, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
 
@@ -424,16 +429,12 @@ void draw_scr_bpt_cal_required(enum scroll_dir m_scroll_dir, uint32_t arg1, uint
 
 
 // HRV screen functions
-void draw_scr_hrv(enum scroll_dir m_scroll_dir,uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
-static void hrv_update_display(void);
-void hrv_check_and_transition(void);
-void scr_hrv_measure_btn_event_handler(lv_event_t *e);
+void draw_scr_hrv(enum scroll_dir m_scroll_dir, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
+void hpi_disp_hrv_update(uint32_t rmssd, int32_t baseline, int32_t threshold, bool stressed);
 
 
 //HRV frequnecy screen functions
-static void lvgl_update_cb(void *user_data);
 int get_stress_percentage(float lf, float hf);
-static lv_color_t get_stress_arc_color(int stress_percentage);
 void gesture_handler(lv_event_t *e);
 void gesture_down_scr_spl_hrv(void);
 //void draw_scr_hrv_frequency_compact(enum scroll_dir m_scroll_dir, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
@@ -515,10 +516,18 @@ void draw_scr_spl_plot_ecg(enum scroll_dir m_scroll_dir, uint32_t arg1, uint32_t
 
 void draw_scr_temp(enum scroll_dir m_scroll_dir);
 
-// GSR Screen functions
-void draw_scr_gsr(enum scroll_dir m_scroll_dir);
-void hpi_gsr_disp_update_gsr_int(uint16_t gsr_value_x100, int64_t gsr_last_update);
-void hpi_gsr_process_bioz_sample(int32_t bioz_sample);
+// GSR Screen live update function (draw_scr_gsr declared above in CONFIG block)
+void hpi_disp_gsr_update(int32_t ema, int32_t baseline, int32_t threshold, bool stressed);
+
+// RR interval plot screen
+void draw_scr_rr_plot(enum scroll_dir m_scroll_dir, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
+void hpi_disp_rr_plot_update(const uint16_t *rr_buf, uint8_t rr_count);
+void gesture_down_scr_rr_plot(void);
+
+// GSR live EMA plot screen
+void draw_scr_gsr_live_plot(enum scroll_dir m_scroll_dir, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
+void hpi_disp_gsr_live_plot_update(const int32_t *ema_buf, uint8_t buf_count, int32_t threshold);
+void gesture_down_scr_gsr_live_plot(void);
 
 void hpi_disp_home_update_batt_level(int batt_level, bool charging);
 void hpi_disp_settings_update_batt_level(int batt_level, bool charging);
@@ -548,7 +557,6 @@ extern uint16_t m_user_weight;
 void hpi_ecg_disp_draw_plotECG_hrv(int32_t *data_ecg, int num_samples, bool ecg_lead_off);
 void scr_hrv_lead_on_off_handler(bool lead_off);
 void gesture_down_scr_ecg_hrv(void);
-static void scr_hrv_btn_start_handler(lv_event_t *e);
 void hpi_hrv_reset_countdown_timer(void);
 void unload_scr_hrv_eval_progress(void);
 void hpi_hrv_disp_update_timer(uint16_t remaining_s);

@@ -90,6 +90,8 @@
 
 LOG_MODULE_REGISTER(hw_module, LOG_LEVEL_DBG);
 
+ZBUS_CHAN_DECLARE(haptic_alert_chan);
+
 // Re-define battery constants for backward compatibility
 #define HPI_BATTERY_SHUTDOWN_VOLTAGE 3.0f
 
@@ -320,6 +322,13 @@ static void gpio_keys_cb_handler(struct input_event *evt, void *user_data)
             LOG_INF("Crown Key Pressed");
             k_sem_give(&sem_crown_key_pressed);
             haptic_send_alert(1);
+            {
+                struct hpi_haptic_alert_t alert = {
+                    .sensors_triggered = 0xFF,
+                    .count = 1,
+                };
+                zbus_chan_pub(&haptic_alert_chan, &alert, K_NO_WAIT);
+            }
             break;
         case INPUT_KEY_HOME:
             LOG_INF("Extra Key Pressed");
